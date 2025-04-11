@@ -227,12 +227,14 @@ try {
             Write-Host "Data loaded for $table"
         }
         catch {
-            Write-Host ("Error loading data for $table: " + $_)
+            Write-Host "Error loading data for $table" 
+            Write-Host $_
         }
     }
 }
 catch {
-    write-host ("Error in data loading: " + $_)
+    write-host "Error in data loading"
+    write-host $_
 }
 
 # Upload files to data lake (original code kept as it doesn't use bcp)
