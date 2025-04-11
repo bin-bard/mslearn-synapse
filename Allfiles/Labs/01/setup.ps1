@@ -166,24 +166,77 @@ New-AzRoleAssignment -SignInName $userName -RoleDefinitionName "Storage Blob Dat
 
 # Create database
 write-host "Creating the $sqlDatabaseName database..."
-sqlcmd -S "$synapseWorkspace.sql.azuresynapse.net" -U $sqlUser -P $sqlPassword -d $sqlDatabaseName -I -i setup.sql
+# Thay thế sqlcmd bằng Invoke-SqlCmd thông qua REST API
+try {
+    $token = (Get-AzAccessToken -ResourceUrl https://database.windows.net).Token
+    $headers = @{ 
+        Authorization = "Bearer $token"
+        "Content-Type" = "application/json" 
+    }
+    $sqlScript = Get-Content -Path "setup.sql" -Raw
+    $uri = "https://$synapseWorkspace.sql.azuresynapse.net:1443/databases/$sqlDatabaseName/ddl?api-version=2018-06-01-preview"
+    Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body $sqlScript
+    write-host "SQL database created successfully using REST API"
+} 
+catch {
+    write-host "Error creating database: $_"
+    write-host "Will attempt to continue with other steps..."
+}
 
 # Load data
 write-host "Loading data..."
-Get-ChildItem "./data/*.txt" -File | Foreach-Object {
-    write-host ""
-    $file = $_.FullName
-    Write-Host "$file"
-    $table = $_.Name.Replace(".txt","")
-    bcp dbo.$table in $file -S "$synapseWorkspace.sql.azuresynapse.net" -U $sqlUser -P $sqlPassword -d $sqlDatabaseName -f $file.Replace("txt", "fmt") -q -k -E -b 5000
+try {
+    # Tạo container cho import
+    $containerName = "sqlimport"
+    $storageAccount = Get-AzStorageAccount -ResourceGroupName $resourceGroupName -Name $dataLakeAccountName
+    $storageContext = $storageAccount.Context
+    New-AzStorageContainer -Name $containerName -Context $storageContext -ErrorAction SilentlyContinue
+    
+    # Upload files và sử dụng COPY INTO
+    Get-ChildItem "./data/*.txt" -File | Foreach-Object {
+        write-host ""
+        $file = $_.FullName
+        $fileName = $_.Name
+        Write-Host "Processing $fileName"
+        # Upload file to storage
+        Set-AzStorageBlobContent -File $file -Container $containerName -Blob $fileName -Context $storageContext -Force
+        
+        $table = $_.Name.Replace(".txt","")
+        $uri = "https://$dataLakeAccountName.blob.core.windows.net/$containerName/$fileName"
+        
+        # Generate SAS token
+        $token = (New-AzStorageContainerSASToken -Name $containerName -Context $storageContext -Permission r).Substring(1)
+        
+        # Create COPY INTO T-SQL statement
+        $copyCmd = @"
+        COPY INTO dbo.$table FROM '$uri'
+        WITH (
+            FILE_TYPE = 'CSV',
+            CREDENTIAL = (IDENTITY = 'Shared Access Signature', SECRET = '$token'),
+            FIELDTERMINATOR = '\t',
+            FIRSTROW = 1
+        )
+"@
+        
+        # Execute COPY INTO using REST API
+        $uri = "https://$synapseWorkspace.sql.azuresynapse.net:1443/databases/$sqlDatabaseName/query?api-version=2018-06-01-preview"
+        $body = @{ query = $copyCmd } | ConvertTo-Json
+        
+        try {
+            Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body $body -ContentType "application/json"
+            Write-Host "Data loaded for $table"
+        }
+        catch {
+            Write-Host "Error loading data for $table: $_"
+        }
+    }
+}
+catch {
+    write-host "Error in data loading: $_"
 }
 
-# Pause SQL Pool
-write-host "Pausing the $sqlDatabaseName SQL Pool..."
-Suspend-AzSynapseSqlPool -WorkspaceName $synapseWorkspace -Name $sqlDatabaseName -AsJob
-
-# Upload files
-write-host "Loading data..."
+# Upload files to data lake (original code kept as it doesn't use bcp)
+write-host "Loading data to data lake..."
 $storageAccount = Get-AzStorageAccount -ResourceGroupName $resourceGroupName -Name $dataLakeAccountName
 $storageContext = $storageAccount.Context
 Get-ChildItem "./files/*.csv" -File | Foreach-Object {
@@ -193,6 +246,10 @@ Get-ChildItem "./files/*.csv" -File | Foreach-Object {
     $blobPath = "sales_data/$file"
     Set-AzStorageBlobContent -File $_.FullName -Container "files" -Blob $blobPath -Context $storageContext
 }
+
+# Pause SQL Pool
+write-host "Pausing the $sqlDatabaseName SQL Pool..."
+Suspend-AzSynapseSqlPool -WorkspaceName $synapseWorkspace -Name $sqlDatabaseName -AsJob
 
 # Create KQL script
 New-AzSynapseKqlScript -WorkspaceName $synapseWorkspace -DefinitionFile "./files/ingest-data.kql"
